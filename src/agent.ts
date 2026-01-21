@@ -1,12 +1,12 @@
 // ============================================================
 // COLE MERCER - Agent (Durable Object)
-// Version: 1.1.0 - Integrated with central accounts service
+// Version: 1.1.1 - Fixed accounts service URL
 // ============================================================
 
 import Anthropic from '@anthropic-ai/sdk';
 import { SYSTEM_PROMPT, CHARACTER_INFO, getContextualPrompt, getWelcomePrompt } from './personality';
 
-const ACCOUNTS_SERVICE_URL = 'https://companion-accounts.micaiah-tasks.workers.dev';
+const ACCOUNTS_SERVICE_URL = 'https://companion-accounts.mrmicaiah.workers.dev';
 const CHARACTER_NAME = 'cole';
 
 interface Env {
@@ -146,12 +146,12 @@ export class ColeAgent {
     }
   }
 
-  private async initiatePaywall(chatId: string, email: string): Promise<{ success: boolean; message: string }> {
+  private async initiatePaywall(chatId: string, email: string, firstName?: string): Promise<{ success: boolean; message: string }> {
     try {
       const response = await fetch(`${ACCOUNTS_SERVICE_URL}/link/initiate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email, chatId, character: CHARACTER_NAME })
+        body: JSON.stringify({ email, chatId, character: CHARACTER_NAME, firstName })
       });
       return await response.json() as { success: boolean; message: string };
     } catch (error) {
@@ -176,6 +176,19 @@ export class ColeAgent {
         };
         await this.handleMessage(data);
         return new Response('OK');
+      }
+      
+      // Endpoint for billing system to activate user
+      if (url.pathname === '/billing/activate' && request.method === 'POST') {
+        const data = await request.json() as { chat_id: string; account_id: string; email: string };
+        this.sql.exec(`UPDATE users SET status = 'active', paywall_state = 'none' WHERE chat_id = ?`, data.chat_id);
+        
+        const userResult = this.sql.exec(`SELECT * FROM users WHERE chat_id = ?`, data.chat_id).toArray();
+        if (userResult.length > 0) {
+          const user = userResult[0] as User;
+          await this.sendMessage(data.chat_id, `You're all set ${user.first_name}! 💪 Unlimited coaching unlocked. Let's get after it!`);
+        }
+        return this.jsonResponse({ success: true });
       }
       
       if (url.pathname === '/rhythm/checkAllUsers') {
@@ -346,8 +359,8 @@ export class ColeAgent {
       return;
     }
     
-    // Send to accounts service
-    const result = await this.initiatePaywall(user.chat_id, email);
+    // Send to accounts service with firstName
+    const result = await this.initiatePaywall(user.chat_id, email, user.first_name);
     
     if (result.success) {
       this.sql.exec(`UPDATE users SET paywall_state = 'awaiting_payment' WHERE chat_id = ?`, user.chat_id);
