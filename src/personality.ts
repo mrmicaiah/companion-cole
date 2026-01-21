@@ -3,6 +3,33 @@
 // Health/Fitness Mentor - Austin, TX
 // ============================================================
 
+// Helper to get local time components in character's timezone
+function getLocalTime(date: Date, timezone: string): { hour: number; dayOfWeek: number; month: number; timeStr: string } {
+  const options: Intl.DateTimeFormatOptions = {
+    weekday: 'long',
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+    timeZone: timezone
+  };
+  const timeStr = date.toLocaleString('en-US', options);
+  
+  // Extract hour in local timezone
+  const hourStr = date.toLocaleString('en-US', { hour: 'numeric', hour12: false, timeZone: timezone });
+  const hour = parseInt(hourStr, 10);
+  
+  // Extract day of week in local timezone (0 = Sunday)
+  const dayStr = date.toLocaleString('en-US', { weekday: 'short', timeZone: timezone });
+  const dayMap: Record<string, number> = { 'Sun': 0, 'Mon': 1, 'Tue': 2, 'Wed': 3, 'Thu': 4, 'Fri': 5, 'Sat': 6 };
+  const dayOfWeek = dayMap[dayStr] ?? 0;
+  
+  // Extract month in local timezone (0 = January)
+  const monthStr = date.toLocaleString('en-US', { month: 'numeric', timeZone: timezone });
+  const month = parseInt(monthStr, 10) - 1;
+  
+  return { hour, dayOfWeek, month, timeStr };
+}
+
 export const SYSTEM_PROMPT = `You are Cole Mercer. 34. Austin. You own a small gym called Mercer Strength — squat racks, platforms, dumbbells, nothing fancy. The kind of place serious people train. You bought it six years ago and built it into something real.
 
 You mentor people in fitness and health. Not for money — because someone did it for you once. A guy named Ray saw you flailing in the gym at 19 and taught you everything. Changed your life. He died when you were 24. Now you pay it forward.
@@ -206,17 +233,8 @@ export function getContextualPrompt(context: {
   sessionList?: string;
   vibe?: string;
 }): string {
-  const timeStr = context.currentTime.toLocaleString('en-US', {
-    weekday: 'long',
-    hour: 'numeric',
-    minute: '2-digit',
-    hour12: true,
-    timeZone: 'America/Chicago'
-  });
-
-  const hour = context.currentTime.getHours();
-  const dayOfWeek = context.currentTime.getDay();
-  const month = context.currentTime.getMonth();
+  // Get time in Cole's timezone (Austin = Central)
+  const { hour, dayOfWeek, month, timeStr } = getLocalTime(context.currentTime, 'America/Chicago');
 
   let lifeTexture = '';
   
@@ -261,6 +279,7 @@ export function getContextualPrompt(context: {
     lifeTexture = lateActivities[Math.floor(Math.random() * lateActivities.length)];
   }
 
+  // Thursday evening = basketball
   if (dayOfWeek === 4 && hour >= 19 && hour < 22) {
     lifeTexture = "Just finished pickup basketball. Good run tonight.";
   }
@@ -288,7 +307,8 @@ export function getContextualPrompt(context: {
     }
   }
 
-  if (month >= 3 && month <= 10) {
+  // Outdoor activities in warmer months (March-October)
+  if (month >= 2 && month <= 9) {
     if (dayOfWeek === 0 || dayOfWeek === 6) {
       if (Math.random() > 0.6) {
         const outdoorTextures = [
