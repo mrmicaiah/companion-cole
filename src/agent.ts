@@ -1,12 +1,12 @@
 // ============================================================
 // COLE MERCER - Agent (Durable Object)
-// Version: 1.1.1 - Fixed accounts service URL
+// Version: 1.1.2 - Fixed accounts service URL subdomain
 // ============================================================
 
 import Anthropic from '@anthropic-ai/sdk';
 import { SYSTEM_PROMPT, CHARACTER_INFO, getContextualPrompt, getWelcomePrompt } from './personality';
 
-const ACCOUNTS_SERVICE_URL = 'https://companion-accounts.mrmicaiah.workers.dev';
+const ACCOUNTS_SERVICE_URL = 'https://companion-accounts.micaiah-tasks.workers.dev';
 const CHARACTER_NAME = 'cole';
 
 interface Env {
