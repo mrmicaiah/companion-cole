@@ -1,22 +1,31 @@
 // ============================================================
 // COLE MERCER - Agent (Durable Object)
-// Version: 1.1.1 - Fixed accounts service URL
+// Version: 2.0.0 - Session-aware memory + 45min timeout
+// Changes:
+// - Session timeout reduced to 45 minutes (was 2 hours)
+// - Message history now scoped to current session only
+// - R2 memory system integration with extraction
+// - Recent conversation summaries available for reference
 // ============================================================
 
 import Anthropic from '@anthropic-ai/sdk';
-import { SYSTEM_PROMPT, CHARACTER_INFO, getContextualPrompt, getWelcomePrompt } from './personality';
-
-const ACCOUNTS_SERVICE_URL = 'https://companion-accounts.mrmicaiah.workers.dev';
-const CHARACTER_NAME = 'cole';
+import { buildPrompt, CHARACTER_INFO } from './personality';
+import {
+  initializeUserMemory,
+  loadHotMemory,
+  formatMemoryForPrompt,
+  HotMemory
+} from './memory';
+import { runExtractions } from './extraction';
 
 interface Env {
   MEMORY: R2Bucket;
   ANTHROPIC_API_KEY: string;
   TELEGRAM_BOT_TOKEN: string;
+  ACCOUNTS_URL?: string;
 }
 
-type UserStatus = 'new' | 'trial' | 'hooked' | 'active' | 'paused' | 'churned';
-type PaywallState = 'none' | 'awaiting_email' | 'awaiting_payment';
+type UserStatus = 'new' | 'trial' | 'awaiting_email' | 'pending_payment' | 'active' | 'paused' | 'churned';
 
 interface User {
   chat_id: string;
@@ -25,6 +34,8 @@ interface User {
   last_name?: string;
   username?: string;
   status: UserStatus;
+  email?: string;
+  account_id?: string;
   message_count: number;
   trial_messages_remaining: number;
   created_at: string;
@@ -32,7 +43,6 @@ interface User {
   last_outreach_at?: string;
   timezone_offset?: number;
   ref_code?: string;
-  paywall_state: PaywallState;
 }
 
 interface Session {
@@ -42,15 +52,15 @@ interface Session {
   ended_at?: string;
   summary?: string;
   message_count: number;
+  extraction_done?: number;
 }
 
-interface AccessCheckResult {
-  hasAccess: boolean;
-  reason: 'subscribed' | 'trial' | 'no_access' | 'trial_expired';
-  trialRemaining?: number;
-  accountId?: string;
-  email?: string;
-}
+const TRIAL_MESSAGE_LIMIT = 25;
+const SESSION_TIMEOUT_MS = 45 * 60 * 1000; // 45 minutes
+const EXTRACTION_DELAY_MS = 15 * 60 * 1000; // 15 minutes of silence
+const CHARACTER_NAME = 'cole';
+
+const EMAIL_REGEX = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
 
 export class ColeAgent {
   private state: DurableObjectState;
@@ -73,14 +83,15 @@ export class ColeAgent {
         last_name TEXT,
         username TEXT,
         status TEXT DEFAULT 'new',
+        email TEXT,
+        account_id TEXT,
         message_count INTEGER DEFAULT 0,
-        trial_messages_remaining INTEGER DEFAULT 25,
+        trial_messages_remaining INTEGER DEFAULT ${TRIAL_MESSAGE_LIMIT},
         created_at TEXT,
         last_message_at TEXT,
         last_outreach_at TEXT,
         timezone_offset INTEGER,
-        ref_code TEXT,
-        paywall_state TEXT DEFAULT 'none'
+        ref_code TEXT
       );
       
       CREATE TABLE IF NOT EXISTS messages (
@@ -98,7 +109,8 @@ export class ColeAgent {
         started_at TEXT NOT NULL,
         ended_at TEXT,
         summary TEXT,
-        message_count INTEGER DEFAULT 0
+        message_count INTEGER DEFAULT 0,
+        extraction_done INTEGER DEFAULT 0
       );
       
       CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat_id);
@@ -107,60 +119,7 @@ export class ColeAgent {
       CREATE INDEX IF NOT EXISTS idx_users_status ON users(status);
       CREATE INDEX IF NOT EXISTS idx_users_last_message ON users(last_message_at);
     `);
-    
-    // Migration: add paywall_state column if it doesn't exist
-    try {
-      this.sql.exec(`ALTER TABLE users ADD COLUMN paywall_state TEXT DEFAULT 'none'`);
-    } catch (e) {
-      // Column already exists
-    }
   }
-
-  // ==================== ACCOUNTS SERVICE INTEGRATION ====================
-
-  private async checkAccess(chatId: string): Promise<AccessCheckResult> {
-    try {
-      const response = await fetch(`${ACCOUNTS_SERVICE_URL}/access/${chatId}/${CHARACTER_NAME}`);
-      if (!response.ok) {
-        console.error('Access check failed:', response.status);
-        // Fail open - allow access if service is down
-        return { hasAccess: true, reason: 'trial', trialRemaining: 25 };
-      }
-      return await response.json() as AccessCheckResult;
-    } catch (error) {
-      console.error('Access check error:', error);
-      // Fail open
-      return { hasAccess: true, reason: 'trial', trialRemaining: 25 };
-    }
-  }
-
-  private async decrementTrial(chatId: string): Promise<void> {
-    try {
-      await fetch(`${ACCOUNTS_SERVICE_URL}/trial/decrement`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chatId, character: CHARACTER_NAME })
-      });
-    } catch (error) {
-      console.error('Trial decrement error:', error);
-    }
-  }
-
-  private async initiatePaywall(chatId: string, email: string, firstName?: string): Promise<{ success: boolean; message: string }> {
-    try {
-      const response = await fetch(`${ACCOUNTS_SERVICE_URL}/link/initiate`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email, chatId, character: CHARACTER_NAME, firstName })
-      });
-      return await response.json() as { success: boolean; message: string };
-    } catch (error) {
-      console.error('Paywall initiate error:', error);
-      return { success: false, message: 'Something went wrong. Please try again.' };
-    }
-  }
-
-  // ==================== MAIN HANDLERS ====================
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
@@ -178,21 +137,32 @@ export class ColeAgent {
         return new Response('OK');
       }
       
-      // Endpoint for billing system to activate user
       if (url.pathname === '/billing/activate' && request.method === 'POST') {
         const data = await request.json() as { chat_id: string; account_id: string; email: string };
-        this.sql.exec(`UPDATE users SET status = 'active', paywall_state = 'none' WHERE chat_id = ?`, data.chat_id);
-        
-        const userResult = this.sql.exec(`SELECT * FROM users WHERE chat_id = ?`, data.chat_id).toArray();
-        if (userResult.length > 0) {
-          const user = userResult[0] as User;
-          await this.sendMessage(data.chat_id, `You're all set ${user.first_name}! 💪 Unlimited coaching unlocked. Let's get after it!`);
-        }
+        await this.activateUser(data.chat_id, data.account_id, data.email);
         return this.jsonResponse({ success: true });
+      }
+      
+      if (url.pathname.startsWith('/billing/status/')) {
+        const chatId = url.pathname.split('/').pop();
+        const userResult = this.sql.exec(`SELECT * FROM users WHERE chat_id = ?`, chatId).toArray();
+        if (userResult.length === 0) return this.jsonResponse({ error: 'User not found' }, 404);
+        const user = userResult[0] as User;
+        return this.jsonResponse({ 
+          status: user.status, 
+          email: user.email,
+          account_id: user.account_id,
+          trial_remaining: user.trial_messages_remaining
+        });
       }
       
       if (url.pathname === '/rhythm/checkAllUsers') {
         await this.checkAllUsersForOutreach();
+        return new Response('OK');
+      }
+      
+      if (url.pathname === '/rhythm/processExtractions') {
+        await this.processStaleExtractions();
         return new Response('OK');
       }
       
@@ -211,11 +181,10 @@ export class ColeAgent {
         const userResult = this.sql.exec(`SELECT * FROM users WHERE chat_id = ?`, chatId).toArray();
         if (userResult.length === 0) return this.jsonResponse({ error: 'User not found' }, 404);
         const user = userResult[0];
-        
         const sessions = this.sql.exec(`SELECT * FROM sessions WHERE chat_id = ? ORDER BY started_at DESC LIMIT 10`, chatId).toArray();
         const recentMessages = this.sql.exec(`SELECT * FROM messages WHERE chat_id = ? ORDER BY timestamp DESC LIMIT 20`, chatId).toArray();
-        
-        return this.jsonResponse({ user, sessions, recentMessages });
+        const memory = await loadHotMemory(this.env.MEMORY, chatId as string);
+        return this.jsonResponse({ user, sessions, recentMessages, memory });
       }
       
       if (url.pathname === '/debug/stats') {
@@ -223,13 +192,35 @@ export class ColeAgent {
         const messageCount = this.sql.exec(`SELECT COUNT(*) as count FROM messages`).toArray()[0];
         const sessionCount = this.sql.exec(`SELECT COUNT(*) as count FROM sessions`).toArray()[0];
         const statusBreakdown = this.sql.exec(`SELECT status, COUNT(*) as count FROM users GROUP BY status`).toArray();
-        
         return this.jsonResponse({
           users: userCount?.count || 0,
           messages: messageCount?.count || 0,
           sessions: sessionCount?.count || 0,
           byStatus: statusBreakdown
         });
+      }
+      
+      if (url.pathname === '/debug/test-r2') {
+        try {
+          const testKey = `test/connection_${Date.now()}.json`;
+          await this.env.MEMORY.put(testKey, JSON.stringify({ test: true, timestamp: new Date().toISOString() }));
+          const result = await this.env.MEMORY.get(testKey);
+          const data = result ? await result.json() : null;
+          await this.env.MEMORY.delete(testKey);
+          return this.jsonResponse({ success: true, wrote: true, read: data });
+        } catch (e) {
+          return this.jsonResponse({ success: false, error: String(e) }, 500);
+        }
+      }
+      
+      if (url.pathname.startsWith('/debug/init-memory/')) {
+        const chatId = url.pathname.split('/').pop();
+        const userResult = this.sql.exec(`SELECT * FROM users WHERE chat_id = ?`, chatId).toArray();
+        if (userResult.length === 0) return this.jsonResponse({ error: 'User not found' }, 404);
+        const user = userResult[0] as User;
+        await initializeUserMemory(this.env.MEMORY, chatId!, user.first_name);
+        const memory = await loadHotMemory(this.env.MEMORY, chatId!);
+        return this.jsonResponse({ success: true, initialized: true, memory });
       }
       
       return new Response('Not found', { status: 404 });
@@ -249,74 +240,76 @@ export class ColeAgent {
     const { content, chatId, user: telegramUser, refCode } = data;
     const now = new Date();
     
-    // Get or create local user record
     const userResult = this.sql.exec(`SELECT * FROM users WHERE chat_id = ?`, chatId).toArray();
     let user = userResult.length > 0 ? userResult[0] as User : null;
     const isFirstTimeUser = !user;
     
     if (!user) {
       this.sql.exec(`
-        INSERT INTO users (chat_id, telegram_id, first_name, last_name, username, status, created_at, last_message_at, trial_messages_remaining, ref_code, paywall_state)
-        VALUES (?, ?, ?, ?, ?, 'trial', ?, ?, 25, ?, 'none')
+        INSERT INTO users (chat_id, telegram_id, first_name, last_name, username, status, created_at, last_message_at, trial_messages_remaining, ref_code)
+        VALUES (?, ?, ?, ?, ?, 'trial', ?, ?, ?, ?)
       `, chatId, telegramUser.id, telegramUser.firstName, telegramUser.lastName || null, 
-         telegramUser.username || null, now.toISOString(), now.toISOString(), refCode || null);
+         telegramUser.username || null, now.toISOString(), now.toISOString(), TRIAL_MESSAGE_LIMIT, refCode || null);
       
       const newUserResult = this.sql.exec(`SELECT * FROM users WHERE chat_id = ?`, chatId).toArray();
       user = newUserResult[0] as User;
     }
     
-    // Handle /start command
+    // Always ensure R2 memory exists
+    await initializeUserMemory(this.env.MEMORY, chatId, user.first_name);
+    
     if (content === '__START__') {
-      // Reset paywall state on new start
-      this.sql.exec(`UPDATE users SET paywall_state = 'none' WHERE chat_id = ?`, chatId);
       await this.sendWelcomeMessage(user, isFirstTimeUser);
       return;
     }
     
-    // Check if user is in paywall flow
-    const paywallState = (user.paywall_state || 'none') as PaywallState;
+    // Magic link flow
+    if (user.status === 'awaiting_email') {
+      const trimmedContent = content.trim().toLowerCase();
+      if (EMAIL_REGEX.test(trimmedContent)) {
+        await this.handleEmailSubmission(user, trimmedContent);
+        return;
+      } else {
+        await this.sendMessage(chatId, `hmm that doesn't look like an email address. just type your email and i'll send you a link to get set up.`);
+        return;
+      }
+    }
     
-    if (paywallState === 'awaiting_email') {
-      await this.handleEmailSubmission(user, content);
+    if (user.status === 'pending_payment') {
+      const trimmedContent = content.trim().toLowerCase();
+      if (EMAIL_REGEX.test(trimmedContent)) {
+        await this.handleEmailSubmission(user, trimmedContent);
+        return;
+      }
+      await this.sendMessage(chatId, `i already sent you a magic link. check your inbox at ${user.email}. if you can't find it, type your email again and i'll send a new one.`);
       return;
     }
     
-    // Check access via central accounts service
-    const access = await this.checkAccess(chatId);
-    
-    if (!access.hasAccess) {
-      if (access.reason === 'trial_expired') {
-        // Trigger paywall
-        this.sql.exec(`UPDATE users SET paywall_state = 'awaiting_email' WHERE chat_id = ?`, chatId);
-        await this.sendMessage(chatId, 
-          `Hey ${user.first_name}, I've really enjoyed getting to know you! 💪\n\nYou've used up your free messages, but I'd love to keep coaching you. Drop your email below and I'll send you a link to pick a plan.`
-        );
-        return;
-      } else if (access.reason === 'no_access') {
-        // Has account but not this character - offer upgrade
-        await this.sendMessage(chatId,
-          `Hey ${user.first_name}! Looks like you're already chatting with one of my friends. Want to add me to your plan?\n\n[Upgrade link coming soon]`
-        );
-        return;
-      }
+    // Trial limit check
+    if (user.status === 'trial' && user.trial_messages_remaining <= 0) {
+      this.sql.exec(`UPDATE users SET status = 'awaiting_email' WHERE chat_id = ?`, chatId);
+      await this.sendMessage(chatId, `hey ${user.first_name}. i've enjoyed getting to know you. to keep chatting, i just need your email so we can get you set up. what's a good email for you?`);
+      return;
     }
     
-    // User has access - proceed with conversation
+    // Session management - 45 minute timeout
     const lastSessionResult = this.sql.exec(`SELECT * FROM sessions WHERE chat_id = ? ORDER BY started_at DESC LIMIT 1`, chatId).toArray();
     const lastSession = lastSessionResult.length > 0 ? lastSessionResult[0] as Session : null;
     
-    const needsNewSession = !lastSession || 
-      (now.getTime() - new Date(lastSession.started_at).getTime() > 2 * 60 * 60 * 1000);
+    const lastMessageTime = lastSession ? new Date(lastSession.started_at).getTime() : 0;
+    const timeSinceLastSession = now.getTime() - lastMessageTime;
+    const needsNewSession = !lastSession || timeSinceLastSession > SESSION_TIMEOUT_MS;
     
     let sessionId: string;
+    let isNewSession = false;
     
     if (needsNewSession) {
       if (lastSession && !lastSession.ended_at) {
-        await this.closeSession(lastSession.id, chatId);
+        await this.closeSession(lastSession.id, chatId, lastSession.message_count);
       }
-      
       sessionId = `${chatId}_${Date.now()}`;
       this.sql.exec(`INSERT INTO sessions (id, chat_id, started_at, message_count) VALUES (?, ?, ?, 0)`, sessionId, chatId, now.toISOString());
+      isNewSession = true;
     } else {
       sessionId = lastSession!.id;
     }
@@ -324,65 +317,81 @@ export class ColeAgent {
     // Store user message
     this.sql.exec(`INSERT INTO messages (chat_id, session_id, role, content, timestamp) VALUES (?, ?, 'user', ?, ?)`, chatId, sessionId, content, now.toISOString());
     this.sql.exec(`UPDATE sessions SET message_count = message_count + 1 WHERE id = ?`, sessionId);
-    this.sql.exec(`UPDATE users SET message_count = message_count + 1, last_message_at = ? WHERE chat_id = ?`, now.toISOString(), chatId);
     
-    // Generate and send response
-    const response = await this.generateResponse(chatId, sessionId, user);
+    // Update user stats
+    if (user.status === 'trial') {
+      this.sql.exec(`UPDATE users SET message_count = message_count + 1, trial_messages_remaining = trial_messages_remaining - 1, last_message_at = ? WHERE chat_id = ?`, now.toISOString(), chatId);
+    } else {
+      this.sql.exec(`UPDATE users SET message_count = message_count + 1, last_message_at = ? WHERE chat_id = ?`, now.toISOString(), chatId);
+    }
     
+    // Generate response with session-scoped messages
+    const response = await this.generateResponse(chatId, sessionId, user, isNewSession);
+    
+    // Store assistant response
     this.sql.exec(`INSERT INTO messages (chat_id, session_id, role, content, timestamp) VALUES (?, ?, 'assistant', ?, ?)`, chatId, sessionId, response, new Date().toISOString());
     this.sql.exec(`UPDATE sessions SET message_count = message_count + 1 WHERE id = ?`, sessionId);
     
     await this.sendMessage(chatId, response);
-    
-    // Decrement trial in central service (if on trial)
-    if (access.reason === 'trial') {
-      await this.decrementTrial(chatId);
-      
-      // Notify user when running low
-      if (access.trialRemaining && access.trialRemaining <= 5 && access.trialRemaining > 1) {
-        await this.sendMessage(chatId, `(${access.trialRemaining - 1} free messages remaining)`);
-      }
-    }
-    
-    this.updateUserStatus(chatId);
   }
 
-  private async handleEmailSubmission(user: User, content: string): Promise<void> {
-    const email = content.trim().toLowerCase();
-    
-    // Basic email validation
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(email)) {
-      await this.sendMessage(user.chat_id, 
-        `Hmm, that doesn't look like an email address. Try again?`
-      );
+  private async handleEmailSubmission(user: User, email: string): Promise<void> {
+    if (!this.env.ACCOUNTS_URL) {
+      this.sql.exec(`UPDATE users SET status = 'pending_payment', email = ? WHERE chat_id = ?`, email, user.chat_id);
+      await this.sendMessage(user.chat_id, `got it. ${email}. billing system coming soon - for now, keep chatting.`);
       return;
     }
     
-    // Send to accounts service with firstName
-    const result = await this.initiatePaywall(user.chat_id, email, user.first_name);
-    
-    if (result.success) {
-      this.sql.exec(`UPDATE users SET paywall_state = 'awaiting_payment' WHERE chat_id = ?`, user.chat_id);
-      await this.sendMessage(user.chat_id, 
-        `Perfect! I just sent a link to ${email}. Click it to pick your plan, and then we can keep going. 💪\n\nDidn't get it? Check your spam folder or send me your email again.`
-      );
-    } else {
-      await this.sendMessage(user.chat_id, 
-        `Something went wrong sending that email. Want to try again?`
-      );
+    try {
+      const response = await fetch(`${this.env.ACCOUNTS_URL}/link/initiate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, chatId: user.chat_id, character: CHARACTER_NAME, firstName: user.first_name })
+      });
+      const result = await response.json() as { success: boolean; message: string };
+      
+      if (result.success) {
+        this.sql.exec(`UPDATE users SET status = 'pending_payment', email = ? WHERE chat_id = ?`, email, user.chat_id);
+        await this.sendMessage(user.chat_id, `sent you a magic link to ${email}. click it to pick your plan and we can keep this going. check your spam folder if you don't see it in a minute.`);
+      } else {
+        await this.sendMessage(user.chat_id, `something went wrong sending that email. can you double-check the address and try again?`);
+      }
+    } catch (error) {
+      console.error('Magic link initiation error:', error);
+      await this.sendMessage(user.chat_id, `something went wrong on my end. can you try again in a sec?`);
+    }
+  }
+
+  private async activateUser(chatId: string, accountId: string, email: string): Promise<void> {
+    this.sql.exec(`UPDATE users SET status = 'active', account_id = ?, email = ? WHERE chat_id = ?`, accountId, email, chatId);
+    const userResult = this.sql.exec(`SELECT * FROM users WHERE chat_id = ?`, chatId).toArray();
+    if (userResult.length > 0) {
+      const user = userResult[0] as User;
+      await this.sendMessage(chatId, `you're all set ${user.first_name}. unlimited chats unlocked. so... where were we?`);
     }
   }
 
   private async sendWelcomeMessage(user: User, isFirstTime: boolean): Promise<void> {
     const anthropic = new Anthropic({ apiKey: this.env.ANTHROPIC_API_KEY });
-    const welcomePrompt = getWelcomePrompt(user.first_name, isFirstTime);
+    const memory = await loadHotMemory(this.env.MEMORY, user.chat_id);
+    const memoryContext = formatMemoryForPrompt(memory);
+    
+    let welcomeContext: string;
+    if (user.status === 'active') {
+      welcomeContext = `\n\n[CONTEXT: ${user.first_name} is a paying subscriber coming back. Be warm.]`;
+    } else if (isFirstTime) {
+      welcomeContext = `\n\n[CONTEXT: ${user.first_name} just started chatting for the first time. Introduce yourself naturally. They have ${TRIAL_MESSAGE_LIMIT} free messages.]`;
+    } else {
+      welcomeContext = `\n\n[CONTEXT: ${user.first_name} is back. You've talked before. Be casual.]`;
+    }
+    
+    const systemPrompt = buildPrompt('[new conversation starting]', new Date(), memory.relationship.phase) + memoryContext + welcomeContext;
     
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-20250514',
       max_tokens: 300,
-      system: SYSTEM_PROMPT + `\n\n${welcomePrompt}`,
-      messages: [{ role: 'user', content: '[SYSTEM: User just started a chat. Send your opening message.]' }]
+      system: systemPrompt,
+      messages: [{ role: 'user', content: '[Send your opening message]' }]
     });
     
     const textBlock = response.content.find(b => b.type === 'text');
@@ -391,25 +400,36 @@ export class ColeAgent {
     }
   }
 
-  private async generateResponse(chatId: string, sessionId: string, user: User): Promise<string> {
+  private async generateResponse(chatId: string, sessionId: string, user: User, isNewSession: boolean): Promise<string> {
     const anthropic = new Anthropic({ apiKey: this.env.ANTHROPIC_API_KEY });
     
-    const recentMessages = this.sql.exec(`SELECT role, content FROM messages WHERE chat_id = ? ORDER BY timestamp DESC LIMIT 20`, chatId).toArray().reverse();
+    // KEY: Only load messages from CURRENT session
+    const recentMessages = this.sql.exec(
+      `SELECT role, content FROM messages WHERE session_id = ? ORDER BY timestamp ASC`, 
+      sessionId
+    ).toArray();
     
-    const previousSessions = this.sql.exec(`SELECT * FROM sessions WHERE chat_id = ? AND id != ? AND summary IS NOT NULL ORDER BY started_at DESC LIMIT 5`, chatId, sessionId).toArray() as Session[];
+    const lastUserMessage = recentMessages.filter(m => m.role === 'user').pop();
+    const messageContent = lastUserMessage?.content as string || '';
     
-    const sessionList = previousSessions.map(s => `- ${s.started_at}: ${s.summary}`).join('\n');
+    // Load memory (includes recent conversation summaries)
+    const memory = await loadHotMemory(this.env.MEMORY, chatId);
+    const memoryContext = formatMemoryForPrompt(memory);
     
-    const contextPrompt = getContextualPrompt({
-      currentTime: new Date(),
-      isNewSession: recentMessages.length <= 2,
-      previousSessionSummary: previousSessions[0]?.summary,
-      sessionList: sessionList || undefined
-    });
+    let trialContext = '';
+    if (user.status === 'trial') {
+      const remaining = user.trial_messages_remaining - 1;
+      if (remaining <= 5 && remaining > 0) {
+        trialContext = `\n\n[SYSTEM NOTE: User has ${remaining} free messages remaining. Don't mention this unless natural.]`;
+      }
+    }
     
-    const userContext = `\n## USER INFO\nName: ${user.first_name}${user.last_name ? ' ' + user.last_name : ''}\nMessages exchanged: ${user.message_count}\n`;
+    let sessionContext = '';
+    if (isNewSession && recentMessages.length === 1) {
+      sessionContext = `\n\n[This is a fresh conversation. You remember who they are from your memory, but you don't remember the details of what you were chatting about before. If they reference something specific, check your past conversation summaries.]`;
+    }
     
-    const systemPrompt = SYSTEM_PROMPT + userContext + contextPrompt;
+    const systemPrompt = buildPrompt(messageContent, new Date(), memory.relationship.phase) + memoryContext + trialContext + sessionContext;
     
     const messages = recentMessages.map(m => ({
       role: m.role as 'user' | 'assistant',
@@ -436,41 +456,58 @@ export class ColeAgent {
         body: JSON.stringify({ chat_id: chatId, text: content })
       }
     );
-    
     if (!response.ok) {
       console.error('Telegram error:', await response.text());
     }
   }
 
-  private updateUserStatus(chatId: string): void {
-    const userResult = this.sql.exec(`SELECT * FROM users WHERE chat_id = ?`, chatId).toArray();
-    if (userResult.length === 0) return;
-    const user = userResult[0] as User;
+  private async closeSession(sessionId: string, chatId: string, messageCount: number): Promise<void> {
+    const now = new Date().toISOString();
+    this.sql.exec(`UPDATE sessions SET ended_at = ? WHERE id = ?`, now, sessionId);
     
-    if (user.status === 'trial' && user.message_count >= 10) {
-      this.sql.exec(`UPDATE users SET status = 'hooked' WHERE chat_id = ?`, chatId);
+    if (messageCount >= 4) {
+      const messages = this.sql.exec(`SELECT role, content FROM messages WHERE session_id = ? ORDER BY timestamp`, sessionId).toArray();
+      const transcript = messages.map(m => `${m.role}: ${m.content}`).join('\n');
+      
+      const anthropic = new Anthropic({ apiKey: this.env.ANTHROPIC_API_KEY });
+      
+      try {
+        const result = await runExtractions(this.env.MEMORY, anthropic, chatId, transcript, messageCount);
+        console.log(`Extractions for ${chatId}:`, result);
+        this.sql.exec(`UPDATE sessions SET extraction_done = 1 WHERE id = ?`, sessionId);
+      } catch (e) {
+        console.error('Extraction failed:', e);
+      }
     }
   }
 
-  private async closeSession(sessionId: string, chatId: string): Promise<void> {
-    const messages = this.sql.exec(`SELECT role, content FROM messages WHERE session_id = ? ORDER BY timestamp`, sessionId).toArray();
+  private async processStaleExtractions(): Promise<void> {
+    const cutoff = new Date(Date.now() - EXTRACTION_DELAY_MS).toISOString();
     
-    if (messages.length < 2) {
-      this.sql.exec(`UPDATE sessions SET ended_at = ? WHERE id = ?`, new Date().toISOString(), sessionId);
-      return;
-    }
+    const staleSessions = this.sql.exec(`
+      SELECT s.*, u.chat_id as user_chat_id
+      FROM sessions s
+      JOIN users u ON s.chat_id = u.chat_id
+      WHERE s.ended_at IS NOT NULL 
+        AND s.ended_at < ?
+        AND s.extraction_done = 0
+        AND s.message_count >= 4
+      LIMIT 5
+    `, cutoff).toArray();
     
     const anthropic = new Anthropic({ apiKey: this.env.ANTHROPIC_API_KEY });
-    const conversationText = messages.map(m => `${m.role}: ${m.content}`).join('\n');
     
-    const summaryResponse = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 150,
-      messages: [{ role: 'user', content: `Summarize this conversation in 1-2 sentences:\n\n${conversationText}` }]
-    });
-    
-    const summary = summaryResponse.content.find(b => b.type === 'text')?.text || null;
-    this.sql.exec(`UPDATE sessions SET ended_at = ?, summary = ? WHERE id = ?`, new Date().toISOString(), summary, sessionId);
+    for (const session of staleSessions) {
+      const messages = this.sql.exec(`SELECT role, content FROM messages WHERE session_id = ? ORDER BY timestamp`, session.id).toArray();
+      const transcript = messages.map(m => `${m.role}: ${m.content}`).join('\n');
+      
+      try {
+        await runExtractions(this.env.MEMORY, anthropic, session.chat_id as string, transcript, session.message_count as number);
+        this.sql.exec(`UPDATE sessions SET extraction_done = 1 WHERE id = ?`, session.id);
+      } catch (e) {
+        console.error(`Extraction failed for session ${session.id}:`, e);
+      }
+    }
   }
 
   private async checkAllUsersForOutreach(): Promise<void> {
@@ -479,7 +516,7 @@ export class ColeAgent {
     
     const eligibleUsers = this.sql.exec(`
       SELECT * FROM users 
-      WHERE status IN ('trial', 'hooked', 'active')
+      WHERE status IN ('trial', 'active')
       AND last_message_at < ? AND last_message_at > ?
       AND (last_outreach_at IS NULL OR last_outreach_at < last_message_at)
       LIMIT 10
@@ -491,20 +528,32 @@ export class ColeAgent {
   }
 
   private async sendProactiveMessage(user: User): Promise<void> {
-    const lastSessionResult = this.sql.exec(`SELECT * FROM sessions WHERE chat_id = ? AND summary IS NOT NULL ORDER BY started_at DESC LIMIT 1`, user.chat_id).toArray();
-    const lastSession = lastSessionResult.length > 0 ? lastSessionResult[0] as Session : null;
-    
     const anthropic = new Anthropic({ apiKey: this.env.ANTHROPIC_API_KEY });
+    const memory = await loadHotMemory(this.env.MEMORY, user.chat_id);
+    const memoryContext = formatMemoryForPrompt(memory);
     
-    const prompt = lastSession?.summary 
-      ? `Based on your last conversation about: "${lastSession.summary}", send a brief, natural check-in to ${user.first_name}.`
-      : `Send a brief, natural check-in message to ${user.first_name}.`;
+    const activeThreads = memory.threads.active_threads.filter(t => {
+      const followUp = new Date(t.follow_up_after);
+      return !t.resolved && followUp <= new Date();
+    });
+    
+    let outreachContext = `\n\n[CONTEXT: It's been a day or two since ${user.first_name} messaged. Send a brief, natural check-in. `;
+    if (activeThreads.length > 0) {
+      outreachContext += `You have something to follow up on: "${activeThreads[0].prompt}"`;
+    } else if (memory.relationship.inside_jokes.length > 0) {
+      outreachContext += `Maybe reference something from your history together.`;
+    } else {
+      outreachContext += `Keep it light and casual.`;
+    }
+    outreachContext += `]`;
+    
+    const systemPrompt = buildPrompt('[proactive outreach]', new Date(), memory.relationship.phase) + memoryContext + outreachContext;
     
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-20250514',
       max_tokens: 200,
-      system: SYSTEM_PROMPT + `\n\n${prompt}`,
-      messages: [{ role: 'user', content: '[SYSTEM: Generate proactive outreach]' }]
+      system: systemPrompt,
+      messages: [{ role: 'user', content: '[Send a casual check-in message]' }]
     });
     
     const textBlock = response.content.find(b => b.type === 'text');
@@ -530,7 +579,7 @@ export class ColeAgent {
     }
     
     const pauseCutoff = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
-    this.sql.exec(`UPDATE users SET status = 'paused' WHERE status IN ('trial', 'hooked', 'active') AND last_message_at < ?`, pauseCutoff);
+    this.sql.exec(`UPDATE users SET status = 'paused' WHERE status IN ('trial', 'active') AND last_message_at < ?`, pauseCutoff);
     this.sql.exec(`UPDATE users SET status = 'churned' WHERE status = 'paused' AND last_message_at < ?`, cutoff);
   }
 
