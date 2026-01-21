@@ -1,10 +1,13 @@
 // ============================================================
 // COLE MERCER - Agent (Durable Object)
-// Version: 1.0.1 - Fixed SQL queries
+// Version: 1.1.0 - Integrated with central accounts service
 // ============================================================
 
 import Anthropic from '@anthropic-ai/sdk';
 import { SYSTEM_PROMPT, CHARACTER_INFO, getContextualPrompt, getWelcomePrompt } from './personality';
+
+const ACCOUNTS_SERVICE_URL = 'https://companion-accounts.micaiah-tasks.workers.dev';
+const CHARACTER_NAME = 'cole';
 
 interface Env {
   MEMORY: R2Bucket;
@@ -13,6 +16,7 @@ interface Env {
 }
 
 type UserStatus = 'new' | 'trial' | 'hooked' | 'active' | 'paused' | 'churned';
+type PaywallState = 'none' | 'awaiting_email' | 'awaiting_payment';
 
 interface User {
   chat_id: string;
@@ -28,6 +32,7 @@ interface User {
   last_outreach_at?: string;
   timezone_offset?: number;
   ref_code?: string;
+  paywall_state: PaywallState;
 }
 
 interface Session {
@@ -39,7 +44,13 @@ interface Session {
   message_count: number;
 }
 
-const TRIAL_MESSAGE_LIMIT = 25;
+interface AccessCheckResult {
+  hasAccess: boolean;
+  reason: 'subscribed' | 'trial' | 'no_access' | 'trial_expired';
+  trialRemaining?: number;
+  accountId?: string;
+  email?: string;
+}
 
 export class ColeAgent {
   private state: DurableObjectState;
@@ -63,12 +74,13 @@ export class ColeAgent {
         username TEXT,
         status TEXT DEFAULT 'new',
         message_count INTEGER DEFAULT 0,
-        trial_messages_remaining INTEGER DEFAULT ${TRIAL_MESSAGE_LIMIT},
+        trial_messages_remaining INTEGER DEFAULT 25,
         created_at TEXT,
         last_message_at TEXT,
         last_outreach_at TEXT,
         timezone_offset INTEGER,
-        ref_code TEXT
+        ref_code TEXT,
+        paywall_state TEXT DEFAULT 'none'
       );
       
       CREATE TABLE IF NOT EXISTS messages (
@@ -95,7 +107,60 @@ export class ColeAgent {
       CREATE INDEX IF NOT EXISTS idx_users_status ON users(status);
       CREATE INDEX IF NOT EXISTS idx_users_last_message ON users(last_message_at);
     `);
+    
+    // Migration: add paywall_state column if it doesn't exist
+    try {
+      this.sql.exec(`ALTER TABLE users ADD COLUMN paywall_state TEXT DEFAULT 'none'`);
+    } catch (e) {
+      // Column already exists
+    }
   }
+
+  // ==================== ACCOUNTS SERVICE INTEGRATION ====================
+
+  private async checkAccess(chatId: string): Promise<AccessCheckResult> {
+    try {
+      const response = await fetch(`${ACCOUNTS_SERVICE_URL}/access/${chatId}/${CHARACTER_NAME}`);
+      if (!response.ok) {
+        console.error('Access check failed:', response.status);
+        // Fail open - allow access if service is down
+        return { hasAccess: true, reason: 'trial', trialRemaining: 25 };
+      }
+      return await response.json() as AccessCheckResult;
+    } catch (error) {
+      console.error('Access check error:', error);
+      // Fail open
+      return { hasAccess: true, reason: 'trial', trialRemaining: 25 };
+    }
+  }
+
+  private async decrementTrial(chatId: string): Promise<void> {
+    try {
+      await fetch(`${ACCOUNTS_SERVICE_URL}/trial/decrement`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chatId, character: CHARACTER_NAME })
+      });
+    } catch (error) {
+      console.error('Trial decrement error:', error);
+    }
+  }
+
+  private async initiatePaywall(chatId: string, email: string): Promise<{ success: boolean; message: string }> {
+    try {
+      const response = await fetch(`${ACCOUNTS_SERVICE_URL}/link/initiate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, chatId, character: CHARACTER_NAME })
+      });
+      return await response.json() as { success: boolean; message: string };
+    } catch (error) {
+      console.error('Paywall initiate error:', error);
+      return { success: false, message: 'Something went wrong. Please try again.' };
+    }
+  }
+
+  // ==================== MAIN HANDLERS ====================
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
@@ -171,33 +236,59 @@ export class ColeAgent {
     const { content, chatId, user: telegramUser, refCode } = data;
     const now = new Date();
     
+    // Get or create local user record
     const userResult = this.sql.exec(`SELECT * FROM users WHERE chat_id = ?`, chatId).toArray();
     let user = userResult.length > 0 ? userResult[0] as User : null;
     const isFirstTimeUser = !user;
     
     if (!user) {
       this.sql.exec(`
-        INSERT INTO users (chat_id, telegram_id, first_name, last_name, username, status, created_at, last_message_at, trial_messages_remaining, ref_code)
-        VALUES (?, ?, ?, ?, ?, 'trial', ?, ?, ?, ?)
+        INSERT INTO users (chat_id, telegram_id, first_name, last_name, username, status, created_at, last_message_at, trial_messages_remaining, ref_code, paywall_state)
+        VALUES (?, ?, ?, ?, ?, 'trial', ?, ?, 25, ?, 'none')
       `, chatId, telegramUser.id, telegramUser.firstName, telegramUser.lastName || null, 
-         telegramUser.username || null, now.toISOString(), now.toISOString(), TRIAL_MESSAGE_LIMIT, refCode || null);
+         telegramUser.username || null, now.toISOString(), now.toISOString(), refCode || null);
       
       const newUserResult = this.sql.exec(`SELECT * FROM users WHERE chat_id = ?`, chatId).toArray();
       user = newUserResult[0] as User;
     }
     
+    // Handle /start command
     if (content === '__START__') {
+      // Reset paywall state on new start
+      this.sql.exec(`UPDATE users SET paywall_state = 'none' WHERE chat_id = ?`, chatId);
       await this.sendWelcomeMessage(user, isFirstTimeUser);
       return;
     }
     
-    if (user.status === 'trial' && user.trial_messages_remaining <= 0) {
-      await this.sendMessage(chatId, 
-        `Hey ${user.first_name}. You've hit the limit on free messages. Upgrade to keep going: [Link coming soon]`
-      );
+    // Check if user is in paywall flow
+    const paywallState = (user.paywall_state || 'none') as PaywallState;
+    
+    if (paywallState === 'awaiting_email') {
+      await this.handleEmailSubmission(user, content);
       return;
     }
     
+    // Check access via central accounts service
+    const access = await this.checkAccess(chatId);
+    
+    if (!access.hasAccess) {
+      if (access.reason === 'trial_expired') {
+        // Trigger paywall
+        this.sql.exec(`UPDATE users SET paywall_state = 'awaiting_email' WHERE chat_id = ?`, chatId);
+        await this.sendMessage(chatId, 
+          `Hey ${user.first_name}, I've really enjoyed getting to know you! 💪\n\nYou've used up your free messages, but I'd love to keep coaching you. Drop your email below and I'll send you a link to pick a plan.`
+        );
+        return;
+      } else if (access.reason === 'no_access') {
+        // Has account but not this character - offer upgrade
+        await this.sendMessage(chatId,
+          `Hey ${user.first_name}! Looks like you're already chatting with one of my friends. Want to add me to your plan?\n\n[Upgrade link coming soon]`
+        );
+        return;
+      }
+    }
+    
+    // User has access - proceed with conversation
     const lastSessionResult = this.sql.exec(`SELECT * FROM sessions WHERE chat_id = ? ORDER BY started_at DESC LIMIT 1`, chatId).toArray();
     const lastSession = lastSessionResult.length > 0 ? lastSessionResult[0] as Session : null;
     
@@ -217,18 +308,57 @@ export class ColeAgent {
       sessionId = lastSession!.id;
     }
     
+    // Store user message
     this.sql.exec(`INSERT INTO messages (chat_id, session_id, role, content, timestamp) VALUES (?, ?, 'user', ?, ?)`, chatId, sessionId, content, now.toISOString());
-    
     this.sql.exec(`UPDATE sessions SET message_count = message_count + 1 WHERE id = ?`, sessionId);
-    this.sql.exec(`UPDATE users SET message_count = message_count + 1, trial_messages_remaining = trial_messages_remaining - 1, last_message_at = ? WHERE chat_id = ?`, now.toISOString(), chatId);
+    this.sql.exec(`UPDATE users SET message_count = message_count + 1, last_message_at = ? WHERE chat_id = ?`, now.toISOString(), chatId);
     
+    // Generate and send response
     const response = await this.generateResponse(chatId, sessionId, user);
     
     this.sql.exec(`INSERT INTO messages (chat_id, session_id, role, content, timestamp) VALUES (?, ?, 'assistant', ?, ?)`, chatId, sessionId, response, new Date().toISOString());
     this.sql.exec(`UPDATE sessions SET message_count = message_count + 1 WHERE id = ?`, sessionId);
     
     await this.sendMessage(chatId, response);
+    
+    // Decrement trial in central service (if on trial)
+    if (access.reason === 'trial') {
+      await this.decrementTrial(chatId);
+      
+      // Notify user when running low
+      if (access.trialRemaining && access.trialRemaining <= 5 && access.trialRemaining > 1) {
+        await this.sendMessage(chatId, `(${access.trialRemaining - 1} free messages remaining)`);
+      }
+    }
+    
     this.updateUserStatus(chatId);
+  }
+
+  private async handleEmailSubmission(user: User, content: string): Promise<void> {
+    const email = content.trim().toLowerCase();
+    
+    // Basic email validation
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      await this.sendMessage(user.chat_id, 
+        `Hmm, that doesn't look like an email address. Try again?`
+      );
+      return;
+    }
+    
+    // Send to accounts service
+    const result = await this.initiatePaywall(user.chat_id, email);
+    
+    if (result.success) {
+      this.sql.exec(`UPDATE users SET paywall_state = 'awaiting_payment' WHERE chat_id = ?`, user.chat_id);
+      await this.sendMessage(user.chat_id, 
+        `Perfect! I just sent a link to ${email}. Click it to pick your plan, and then we can keep going. 💪\n\nDidn't get it? Check your spam folder or send me your email again.`
+      );
+    } else {
+      await this.sendMessage(user.chat_id, 
+        `Something went wrong sending that email. Want to try again?`
+      );
+    }
   }
 
   private async sendWelcomeMessage(user: User, isFirstTime: boolean): Promise<void> {
