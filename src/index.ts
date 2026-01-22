@@ -3,11 +3,12 @@
 // ============================================================
 
 import { ColeAgent } from './agent';
+import { initializeR2Structure, verifyR2Structure } from './init-r2';
 
 export { ColeAgent };
 
 const VERSION = {
-  version: '1.0.1',
+  version: '1.0.2',
   character: 'cole',
   display_name: 'Cole Mercer'
 };
@@ -45,6 +46,52 @@ export default {
     
     const id = env.CHARACTER.idFromName('cole-v1');
     const character = env.CHARACTER.get(id);
+
+    // ============================================================
+    // TEMPORARY ADMIN ENDPOINTS - Remove after R2 setup complete
+    // ============================================================
+    
+    if (url.pathname === '/admin/init-r2' && request.method === 'POST') {
+      try {
+        const results = await initializeR2Structure(env.MEMORY);
+        return new Response(JSON.stringify({
+          success: true,
+          created: results.created.length,
+          files: results.created,
+          errors: results.errors
+        }, null, 2), {
+          headers: { 'Content-Type': 'application/json' }
+        });
+      } catch (e) {
+        return new Response(JSON.stringify({
+          success: false,
+          error: (e as Error).message
+        }, null, 2), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+    }
+
+    if (url.pathname === '/admin/verify-r2' && request.method === 'GET') {
+      try {
+        const results = await verifyR2Structure(env.MEMORY);
+        return new Response(JSON.stringify(results, null, 2), {
+          headers: { 'Content-Type': 'application/json' }
+        });
+      } catch (e) {
+        return new Response(JSON.stringify({
+          error: (e as Error).message
+        }, null, 2), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+    }
+
+    // ============================================================
+    // END TEMPORARY ENDPOINTS
+    // ============================================================
 
     if (url.pathname === '/health') {
       return new Response(JSON.stringify({ status: 'ok', ...VERSION }, null, 2), {
