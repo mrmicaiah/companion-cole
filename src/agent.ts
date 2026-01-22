@@ -190,9 +190,25 @@ export class ColeAgent {
       }
       
       if (url.pathname === '/billing/activate' && request.method === 'POST') {
-        const data = await request.json() as { chat_id: string; account_id: string; email: string };
-        await this.activateUser(data.chat_id, data.account_id, data.email);
-        return this.jsonResponse({ success: true });
+        const body = await request.json() as {
+          chat_id: string;
+          account_id: string;
+          email: string;
+        };
+        
+        if (!body.chat_id || !body.account_id) {
+          return this.jsonResponse({ 
+            success: false, 
+            error: 'Missing chat_id or account_id' 
+          }, 400);
+        }
+        
+        await this.activate(body);
+        
+        return this.jsonResponse({ 
+          success: true,
+          chat_id: body.chat_id
+        });
       }
       
       if (url.pathname.startsWith('/billing/status/')) {
@@ -282,6 +298,25 @@ export class ColeAgent {
       console.error('Agent error:', error);
       return this.jsonResponse({ error: String(error) }, 500);
     }
+  }
+
+  // ==================== BILLING ACTIVATION ====================
+  
+  /**
+   * Activate a paid subscription for this user
+   * Called by companion-accounts after successful payment
+   */
+  private async activate(data: { chat_id: string; account_id: string; email: string }): Promise<void> {
+    const { chat_id, account_id, email } = data;
+    
+    // Update user to active status - no message sent
+    this.sql.exec(`
+      UPDATE users 
+      SET status = 'active', 
+          account_id = ?,
+          email = ?
+      WHERE chat_id = ?
+    `, account_id, email, chat_id);
   }
 
   // ==================== MESSAGE HANDLER ====================
@@ -422,15 +457,6 @@ export class ColeAgent {
     } catch (error) {
       console.error('Magic link initiation error:', error);
       await this.sendMessage(user.chat_id, `something went wrong on my end. can you try again in a sec?`);
-    }
-  }
-
-  private async activateUser(chatId: string, accountId: string, email: string): Promise<void> {
-    this.sql.exec(`UPDATE users SET status = 'active', account_id = ?, email = ? WHERE chat_id = ?`, accountId, email, chatId);
-    const userResult = this.sql.exec(`SELECT * FROM users WHERE chat_id = ?`, chatId).toArray();
-    if (userResult.length > 0) {
-      const user = userResult[0] as User;
-      await this.sendMessage(chatId, `You're in, ${user.first_name}. Unlimited access. Now - where were we?`);
     }
   }
 
