@@ -430,7 +430,7 @@ export class ColeAgent {
     const userResult = this.sql.exec(`SELECT * FROM users WHERE chat_id = ?`, chatId).toArray();
     if (userResult.length > 0) {
       const user = userResult[0] as User;
-      await this.sendMessage(chatId, `you're all set ${user.first_name}. unlimited chats unlocked. so... where were we?`);
+      await this.sendMessage(chatId, `You're in, ${user.first_name}. Unlimited access. Now - where were we?`);
     }
   }
 
