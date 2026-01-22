@@ -3,12 +3,18 @@
 // ============================================================
 
 import { ColeAgent } from './agent';
-import { initializeR2Structure, verifyR2Structure } from './init-r2';
+import { 
+  handleCompileEndpoint, 
+  handleSourceList, 
+  handleSourceRead, 
+  handleSourceWrite,
+  handleSourceDelete
+} from './compiler';
 
 export { ColeAgent };
 
 const VERSION = {
-  version: '1.0.2',
+  version: '1.0.3',
   character: 'cole',
   display_name: 'Cole Mercer'
 };
@@ -48,49 +54,52 @@ export default {
     const character = env.CHARACTER.get(id);
 
     // ============================================================
-    // TEMPORARY ADMIN ENDPOINTS - Remove after R2 setup complete
+    // ADMIN API - Character Mind System
     // ============================================================
     
-    if (url.pathname === '/admin/init-r2' && request.method === 'POST') {
-      try {
-        const results = await initializeR2Structure(env.MEMORY);
-        return new Response(JSON.stringify({
-          success: true,
-          created: results.created.length,
-          files: results.created,
-          errors: results.errors
-        }, null, 2), {
-          headers: { 'Content-Type': 'application/json' }
-        });
-      } catch (e) {
-        return new Response(JSON.stringify({
-          success: false,
-          error: (e as Error).message
-        }, null, 2), {
-          status: 500,
-          headers: { 'Content-Type': 'application/json' }
-        });
+    if (url.pathname.startsWith('/admin/')) {
+      const path = url.pathname.replace('/admin/', '');
+      
+      // POST /admin/compile - Compile source files into character.json
+      if (path === 'compile' && request.method === 'POST') {
+        return handleCompileEndpoint(env.MEMORY, 'cole');
       }
-    }
-
-    if (url.pathname === '/admin/verify-r2' && request.method === 'GET') {
-      try {
-        const results = await verifyR2Structure(env.MEMORY);
-        return new Response(JSON.stringify(results, null, 2), {
-          headers: { 'Content-Type': 'application/json' }
-        });
-      } catch (e) {
-        return new Response(JSON.stringify({
-          error: (e as Error).message
-        }, null, 2), {
-          status: 500,
-          headers: { 'Content-Type': 'application/json' }
-        });
+      
+      // GET /admin/source - List all source files
+      if (path === 'source' && request.method === 'GET') {
+        return handleSourceList(env.MEMORY);
       }
+      
+      // GET /admin/source/{path} - Read a specific source file
+      if (path.startsWith('source/') && request.method === 'GET') {
+        const filePath = path.replace('source/', '');
+        return handleSourceRead(env.MEMORY, filePath);
+      }
+      
+      // PUT /admin/source/{path} - Update a source file
+      if (path.startsWith('source/') && request.method === 'PUT') {
+        const filePath = path.replace('source/', '');
+        const content = await request.text();
+        return handleSourceWrite(env.MEMORY, filePath, content);
+      }
+      
+      // DELETE /admin/source/{path} - Delete a source file (non-critical only)
+      if (path.startsWith('source/') && request.method === 'DELETE') {
+        const filePath = path.replace('source/', '');
+        return handleSourceDelete(env.MEMORY, filePath);
+      }
+      
+      // GET /admin/compiled - View the compiled character.json
+      if (path === 'compiled' && request.method === 'GET') {
+        return handleSourceRead(env.MEMORY, 'character.json');
+      }
+      
+      // If no admin route matched, pass to character DO for debug routes
+      return character.fetch(request);
     }
 
     // ============================================================
-    // END TEMPORARY ENDPOINTS
+    // STANDARD ROUTES
     // ============================================================
 
     if (url.pathname === '/health') {
@@ -190,7 +199,7 @@ export default {
       });
     }
 
-    if (url.pathname.startsWith('/debug/') || url.pathname.startsWith('/admin/')) {
+    if (url.pathname.startsWith('/debug/')) {
       return character.fetch(request);
     }
 
